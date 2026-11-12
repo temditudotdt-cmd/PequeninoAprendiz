@@ -1,0 +1,411 @@
+/* Alfa UTMs: pixel das páginas de venda (servido em /t/<chave>/js com a configuração do pixel no fim).
+ * Faz o que o script da UTMify faz, no mesmo formato: guarda as UTMs por 7 dias, completa os links do checkout
+ * (jLj<lead> no utm_source, ::<fbclid>:: no utm_content, organic sem UTM) e dispara PageView, ViewContent (8 s na
+ * página ou rolagem acima de 100 px) e InitiateCheckout no clique do botão de compra, no navegador (fbq) e no nosso
+ * servidor (POST /t/e) com o mesmo id, para o Meta juntar os dois. Não carrega nada além do fbevents.js do Meta. */
+(function (root, factory) {
+  const api = factory(root);
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.AlfaUtmsPixel = api;
+}(typeof self !== 'undefined' ? self : this, (root) => {
+  'use strict';
+
+  const TRACKING_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'src', 'sck', 'click_id', 'ttclid', 'fbclid', 'gclid'];
+  // Também fbp (que o script põe nos links do checkout) e o marcador de teste: a regra de botão por URL compara sem eles.
+  const TRACKING_PARAM = /^(utm_[a-z]+|src|sck|click_id|ttclid|fbclid|gclid|gbraid|wbraid|fbp|alfa_teste)$/i;
+  const FBP = /^fb\.\d\.\d{10,13}\.\d{1,25}$/;
+  const LEAD_SEPARATOR = 'jLj';
+  const CLICK_SEPARATOR = '::';
+  const DAY = 24 * 60 * 60 * 1000;
+  const KEEP_MS = 7 * DAY;
+  const REPEAT_MS = 30 * 60 * 1000;
+  const META_READY_FALLBACK_MS = 3000;
+  const STORAGE = { lead: 'alfaUtms:lead', tracking: 'alfaUtms:utms', fired: 'alfaUtms:fired', test: 'alfaUtms:teste' };
+  // Integrações → Testes: o link de teste traz alfa_teste=<12 dígitos>; vale nas páginas seguintes do funil por 24 h.
+  const TEST_PARAM = 'alfa_teste';
+  const TEST_CODE = /^\d{12}$/;
+  const TEST_MS = DAY;
+  const META_SCRIPT = 'https://connect.facebook.net/en_US/fbevents.js';
+  // Listas do script da UTMify (cdn.utmify.com.br/scripts/pixel/pixel.js, conferido em 10/11/2026).
+  const LINK_KEYWORDS = ['checkout', 'pagamento', 'payment', 'pay', 'kiwify', 'hotmart', 'eduzz', 'monetizze', 'vindi', 'pague', 'comprar',
+    'finalizar', 'compra', 'cart', 'carrinho', 'order', 'pedido', 'confirmar', 'confirmacao', 'confirmation', 'adoorei', 'vega', 'buygoods',
+    'octuspay', 'perfect', 'iexperience', 'payt', 'guru', 'green', 'yampi', 'appmax', 'pepper', 'braip', 'digistore24', 'hub.la', 'jvzoo',
+    'kirvano', 'ticto'];
+  const PATH_KEYWORDS = ['checkout', 'pagamento', 'payment', 'pay', 'pague', 'comprar', 'finalizar', 'compra', 'cart', 'carrinho', 'order',
+    'pedido', 'confirmar', 'confirmacao', 'confirmation'];
+  const BUTTON_KEYWORDS = ['comprar', 'finalizar', 'compra', 'confirmar', 'quero ter', 'proximo passo', 'próximo passo', 'inscrição',
+    'inscricao', 'participar', 'participe', 'quero participar', 'checkout'];
+  const ADD_TO_CART = /adicionar ao carrinho|colocar no carrinho|add to cart/;
+  const CLICKABLE = 'a,button,input[type="submit"],input[type="button"],[role="button"]';
+
+  function read(storage, key) {
+    try { return storage ? storage.getItem(key) : null; } catch (_error) { return null; }
+  }
+  function write(storage, key, value) {
+    try { if (storage) storage.setItem(key, value); } catch (_error) { /* navegador sem armazenamento: segue sem guardar */ }
+  }
+  function readJson(storage, key) {
+    try { return JSON.parse(read(storage, key) || 'null'); } catch (_error) { return null; }
+  }
+
+  function trackingFromUrl(href) {
+    let url;
+    try { url = new URL(String(href || '')); } catch (_error) { return null; }
+    const found = {};
+    TRACKING_KEYS.forEach((key) => {
+      const value = url.searchParams.get(key);
+      if (value) found[key] = value;
+    });
+    return Object.keys(found).length ? found : null;
+  }
+
+  // As UTMs como a UTMify manda ao checkout. Link que já veio completo (de outra página com o script) fica como está.
+  function trackingParams(tracking, lead) {
+    const params = {};
+    if (tracking) TRACKING_KEYS.forEach((key) => { if (tracking[key]) params[key] = String(tracking[key]); });
+    const source = params.utm_source || 'organic';
+    params.utm_source = source.indexOf(LEAD_SEPARATOR) >= 0 ? source : `${source}${LEAD_SEPARATOR}${lead}`;
+    if (params.fbclid && String(params.utm_content || '').indexOf(CLICK_SEPARATOR) < 0) {
+      params.utm_content = `${params.utm_content || ''}${CLICK_SEPARATOR}${params.fbclid}${CLICK_SEPARATOR}`;
+    }
+    return params;
+  }
+
+  // Id do visitante no formato do lead da UTMify (24 hex, começando pela hora), guardado no navegador.
+  function visitorId(storage, now, random) {
+    const stored = read(storage, STORAGE.lead);
+    if (stored && /^[0-9a-f]{24}$/.test(stored)) return stored;
+    let id = `00000000${Math.floor(now / 1000).toString(16)}`.slice(-8);
+    for (let index = 0; index < 16; index += 1) id += Math.floor(random() * 16).toString(16);
+    write(storage, STORAGE.lead, id);
+    return id;
+  }
+
+  // UTMs do link (o último clique vence) ou as guardadas há até 7 dias; sem nenhuma, null (organic).
+  function rememberTracking(storage, href, now) {
+    const fresh = trackingFromUrl(href);
+    if (fresh) {
+      write(storage, STORAGE.tracking, JSON.stringify({ at: now, params: fresh }));
+      return fresh;
+    }
+    const saved = readJson(storage, STORAGE.tracking);
+    return saved && saved.params && typeof saved.at === 'number' && now - saved.at <= KEEP_MS ? saved.params : null;
+  }
+
+  function currentTest(storage, href, now) {
+    let code = null;
+    try { code = new URL(String(href || '')).searchParams.get(TEST_PARAM); } catch (_error) { code = null; }
+    if (code && TEST_CODE.test(code)) {
+      write(storage, STORAGE.test, JSON.stringify({ code, at: now }));
+      return code;
+    }
+    const saved = readJson(storage, STORAGE.test);
+    return saved && TEST_CODE.test(String(saved.code)) && typeof saved.at === 'number' && now - saved.at <= TEST_MS ? String(saved.code) : null;
+  }
+
+  // fbc montado do fbclid guardado, com a hora do clique (formato do Meta: fb.1.<ms>.<fbclid>).
+  function storedFbc(storage, now) {
+    const saved = readJson(storage, STORAGE.tracking);
+    if (!saved || !saved.params || !saved.params.fbclid || typeof saved.at !== 'number' || now - saved.at > KEEP_MS) return null;
+    return `fb.1.${saved.at}.${saved.params.fbclid}`;
+  }
+
+  function decorateHref(href, params, checkoutHost, base) {
+    const raw = String(href || '').trim();
+    if (!raw || raw.charAt(0) === '#') return null;
+    let url;
+    try { url = new URL(raw, base); } catch (_error) { return null; }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+    const toCheckout = url.hostname.toLowerCase() === String(checkoutHost || '').toLowerCase() || url.pathname.indexOf('/checkout/') >= 0;
+    if (!toCheckout) return null;
+    Object.keys(params).forEach((key) => url.searchParams.set(key, params[key]));
+    return url.toString();
+  }
+
+  function normalizeText(value) {
+    let text = String(value === undefined || value === null ? '' : value).replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\u00A0/g, ' ');
+    try { text = text.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch (_error) { /* sem normalize: compara como veio */ }
+    return text.toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  function stripTracking(text) {
+    const at = text.indexOf('?');
+    if (at < 0) return text;
+    const hashAt = text.indexOf('#', at);
+    const query = text.slice(at + 1, hashAt < 0 ? text.length : hashAt).split('&').filter((part) => part && !TRACKING_PARAM.test(part.split('=')[0]));
+    return text.slice(0, at) + (query.length ? `?${query.join('&')}` : '') + (hashAt < 0 ? '' : text.slice(hashAt));
+  }
+
+  function comparableUrl(value) {
+    const bare = (text) => String(text || '').trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/^\/\//, '').replace(/^www\./i, '');
+    return bare(stripTracking(bare(value))).replace(/\/+$/, '').toLowerCase();
+  }
+
+  function hrefLooksLikeCheckout(href, ownHost, checkoutHost) {
+    if (!href) return false;
+    let url;
+    try { url = new URL(href, `https://${ownHost || 'localhost'}/`); } catch (_error) { return false; }
+    const host = url.hostname.toLowerCase();
+    // O domínio do nosso checkout conta sempre (o /botao/<id>/ir dos botões de compra não tem palavra-chave no caminho).
+    if (checkoutHost && host === String(checkoutHost).toLowerCase()) return true;
+    if (host && host !== ownHost && LINK_KEYWORDS.some((keyword) => host.indexOf(keyword) >= 0)) return true;
+    const pathname = url.pathname.toLowerCase();
+    return PATH_KEYWORDS.some((keyword) => new RegExp(`(^|[/._-])${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([/._-]|$)`).test(pathname));
+  }
+
+  // Botão de compra: as regras do pixel (texto contido, classe CSS inteira ou endereço contido, sem as UTMs) e, com a
+  // detecção automática, as palavras do botão e o link para um checkout (como a UTMify).
+  function isCheckoutClick(target, rules, ownHost) {
+    const values = Array.isArray(rules.icMatchValues) ? rules.icMatchValues : [];
+    const text = normalizeText(target.text);
+    const href = String(target.href || '');
+    const classes = (target.classes || []).map(normalizeText);
+    const custom = values.some((value) => {
+      if (rules.icDetection === 'css') {
+        const name = normalizeText(String(value).replace(/^\.+/, ''));
+        return Boolean(name) && classes.indexOf(name) >= 0;
+      }
+      if (rules.icDetection === 'url') {
+        const rule = comparableUrl(value);
+        return Boolean(rule && href) && comparableUrl(href).indexOf(rule) >= 0;
+      }
+      const rule = normalizeText(value);
+      return Boolean(rule) && text.indexOf(rule) >= 0;
+    });
+    if (custom) return true;
+    if (rules.icAutoDetect === false) return false;
+    return hrefLooksLikeCheckout(href, ownHost, rules.checkoutHost) || (Boolean(text) && BUTTON_KEYWORDS.some((keyword) => text.indexOf(normalizeText(keyword)) >= 0));
+  }
+
+  function randomHex(length) {
+    let out = '';
+    try {
+      const bytes = new Uint8Array(Math.ceil(length / 2));
+      root.crypto.getRandomValues(bytes);
+      for (let index = 0; index < bytes.length; index += 1) out += (bytes[index] < 16 ? '0' : '') + bytes[index].toString(16);
+    } catch (_error) {
+      while (out.length < length) out += Math.floor(Math.random() * 16).toString(16);
+    }
+    return out.slice(0, length);
+  }
+
+  function start(config) {
+    if (!config || !root || !root.document) return;
+    // Um por pixel: o mesmo código colado duas vezes roda uma; pixels diferentes na mesma página rodam os dois.
+    const started = root.__alfaUtmsPixels || (root.__alfaUtmsPixels = {});
+    const startKey = String(config.key || config.pixelId || '');
+    if (started[startKey]) return;
+    started[startKey] = true;
+    const doc = root.document;
+    let storage = null;
+    try { storage = root.localStorage; } catch (_error) { storage = null; }
+    const now = Date.now();
+    const pageUrl = String(root.location.href);
+    const ownHost = String(root.location.hostname || '').toLowerCase();
+    const lead = visitorId(storage, now, () => parseInt(randomHex(1), 16) / 16);
+    const tracking = rememberTracking(storage, pageUrl, now);
+    const urlHasClick = Boolean(tracking && trackingFromUrl(pageUrl) && tracking.fbclid);
+    const params = trackingParams(tracking, lead);
+    // Num teste, os eventos vão ao servidor mesmo com o pixel desligado (lá ficam salvos, sem ir ao Meta); o navegador
+    // só usa o pixel do Meta quando ele está ligado.
+    const testCode = currentTest(storage, pageUrl, now);
+    // Modo só UTMs (loja, entrega 2e): guarda UTMs e teste e completa os links; os eventos saem do pixel da loja.
+    const tracks = !config.utmsOnly && Boolean(config.active || testCode);
+
+    // O fbp do pixel do Meta vai junto para o checkout: a Compra (que sai do pedido) leva o mesmo navegador ao Meta. O
+    // cookie nasce quando o pixel carrega, então o clique completa o link de novo.
+    function linkParams() {
+      const fbp = cookie('_fbp');
+      return fbp && FBP.test(fbp) ? Object.assign({}, params, { fbp }) : params;
+    }
+    function decorate(anchor) {
+      if (!anchor || !anchor.getAttribute) return;
+      const next = decorateHref(anchor.getAttribute('href'), linkParams(), config.checkoutHost, String(root.location.href));
+      if (next && next !== anchor.getAttribute('href')) anchor.setAttribute('href', next);
+    }
+    // Link do checkout montado na hora (o "Finalizar compra" do carrinho da loja): a UTMify completava todos os links
+    // da página e o carrinho herdava as UTMs com o lead; aqui a loja pede o link completo.
+    api.decorateUrl = (href) => decorateHref(href, linkParams(), config.checkoutHost, String(root.location.href)) || href;
+    function decorateAll() {
+      const anchors = doc.querySelectorAll('a[href]');
+      for (let index = 0; index < anchors.length; index += 1) decorate(anchors[index]);
+    }
+    if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', decorateAll);
+    else decorateAll();
+    root.addEventListener('load', decorateAll);
+
+    let fbq = null;
+    let metaReady = !config.active || Boolean(config.testMode);
+    const pending = [];
+
+    function cookie(name) {
+      const parts = String(doc.cookie || '').split(';');
+      for (let index = 0; index < parts.length; index += 1) {
+        const at = parts[index].indexOf('=');
+        if (at > 0 && parts[index].slice(0, at).trim() === name) {
+          try { return decodeURIComponent(parts[index].slice(at + 1).trim()); } catch (_error) { return null; }
+        }
+      }
+      return null;
+    }
+
+    function sendNow(payload) {
+      const location = root.location;
+      const fbc = (urlHasClick ? storedFbc(storage, Date.now()) : null) || cookie('_fbc') || storedFbc(storage, Date.now());
+      const body = JSON.stringify({
+        k: config.key, e: payload.e, id: payload.id, v: lead, u: `${location.origin || ''}${location.pathname || ''}`.slice(0, 500),
+        t: String(doc.title || '').slice(0, 200), fbp: cookie('_fbp'), fbc, x: testCode || undefined,
+      });
+      try {
+        if (root.navigator && typeof root.navigator.sendBeacon === 'function' && root.navigator.sendBeacon(config.endpoint, body)) return;
+      } catch (_error) { /* tenta pelo fetch */ }
+      try {
+        if (typeof root.fetch === 'function') root.fetch(config.endpoint, { method: 'POST', body, keepalive: true, mode: 'no-cors', credentials: 'omit' });
+      } catch (_error) { /* sem rede: o evento do navegador já saiu */ }
+    }
+    function flush() {
+      pending.splice(0).forEach(sendNow);
+    }
+    function markReady() {
+      metaReady = true;
+      flush();
+    }
+    // O servidor espera o pixel do Meta criar os cookies (_fbp/_fbc), até 3 s; clique e saída da página mandam na hora.
+    function enqueue(payload, immediate) {
+      pending.push(payload);
+      if (metaReady || immediate) flush();
+    }
+
+    // Por pixel e evento. A janela conta do último disparo de verdade (o repetido não a renova), como o servidor, que
+    // conta do último evento salvo.
+    const firedKey = (name) => `${config.pixelId}:${name}`;
+    function firedRecently(name) {
+      const fired = readJson(storage, STORAGE.fired) || {};
+      return typeof fired[firedKey(name)] === 'number' && Date.now() - fired[firedKey(name)] < REPEAT_MS;
+    }
+    function rememberFired(name) {
+      const fired = readJson(storage, STORAGE.fired) || {};
+      fired[firedKey(name)] = Date.now();
+      write(storage, STORAGE.fired, JSON.stringify(fired));
+    }
+
+    // Repetido em 30 min não sai de novo no navegador; o servidor recebe e guarda como repetido (como a UTMify).
+    function track(name, immediate) {
+      const eventId = `${name}:${randomHex(16)}`;
+      const repeated = name !== 'PageView' && firedRecently(name);
+      if (fbq && !repeated) fbq('trackSingle', config.pixelId, name, {}, { eventID: eventId });
+      if (name !== 'PageView' && !repeated) rememberFired(name);
+      enqueue({ e: name, id: eventId }, immediate);
+    }
+
+    function loadMeta() {
+      if (typeof root.fbq === 'function') {
+        fbq = root.fbq;
+        if (fbq.callMethod) metaReady = true;
+      } else {
+        const stub = function () {
+          if (stub.callMethod) stub.callMethod.apply(stub, arguments);
+          else stub.queue.push(arguments);
+        };
+        root.fbq = stub;
+        if (!root._fbq) root._fbq = stub;
+        stub.push = stub;
+        stub.loaded = true;
+        stub.version = '2.0';
+        stub.queue = [];
+        fbq = stub;
+        const script = doc.createElement('script');
+        script.async = true;
+        script.src = META_SCRIPT;
+        script.onload = markReady;
+        script.onerror = markReady;
+        const first = doc.getElementsByTagName('script')[0];
+        if (first && first.parentNode) first.parentNode.insertBefore(script, first);
+        else if (doc.head) doc.head.appendChild(script);
+      }
+      fbq('init', config.pixelId);
+      root.setTimeout(markReady, META_READY_FALLBACK_MS);
+    }
+
+    // O elemento clicado pelo caminho do evento: o botão de compra do app desenha o link dentro de um shadow DOM, e o
+    // event.target que chega ao document é só a caixa de fora.
+    function clickTarget(event) {
+      const path = event && typeof event.composedPath === 'function' ? event.composedPath() : [];
+      let element = null;
+      let anchor = null;
+      for (let index = 0; index < path.length && !(element && anchor); index += 1) {
+        const node = path[index];
+        if (!node || typeof node.matches !== 'function') continue;
+        let matched = false;
+        try { matched = node.matches(CLICKABLE); } catch (_error) { matched = false; }
+        if (!element && matched) element = node;
+        if (!anchor && String(node.tagName || '').toUpperCase() === 'A') anchor = node;
+      }
+      if (!element && event && event.target && typeof event.target.closest === 'function') element = event.target.closest(CLICKABLE);
+      if (element && !anchor) {
+        anchor = String(element.tagName || '').toUpperCase() === 'A' ? element : (typeof element.closest === 'function' ? element.closest('a') : null);
+      }
+      return { element, anchor };
+    }
+
+    function onClick(event) {
+      const { element, anchor } = clickTarget(event);
+      if (!element) return;
+      decorate(anchor);
+      if (!tracks) return;
+      const isInput = String(element.tagName || '').toUpperCase() === 'INPUT';
+      const info = {
+        text: isInput ? element.value : element.textContent,
+        href: anchor ? anchor.href : '',
+        classes: Array.prototype.slice.call(element.classList || []),
+      };
+      if (config.events && config.events.InitiateCheckout && isCheckoutClick(info, config, ownHost)) track('InitiateCheckout', true);
+      if (config.events && config.events.AddToCart && ADD_TO_CART.test(normalizeText(info.text))) track('AddToCart', true);
+    }
+    doc.addEventListener('click', onClick, true);
+    // auxclick também vem do botão direito (copiar o link): só o do meio (abrir em nova aba) conta.
+    doc.addEventListener('auxclick', (event) => { if (event && event.button === 1) onClick(event); }, true);
+
+    if (!tracks) return;
+    if (config.active && !config.testMode) loadMeta();
+    track('PageView', false);
+
+    let viewed = false;
+    function view() {
+      if (viewed) return;
+      viewed = true;
+      track('ViewContent', false);
+    }
+    root.setTimeout(view, 8000);
+    root.addEventListener('scroll', () => { if ((root.scrollY || 0) > 100) view(); }, { passive: true });
+
+    doc.addEventListener('submit', (event) => {
+      if (!config.events || !config.events.Lead || !event || !event.target || typeof event.target.querySelector !== 'function') return;
+      let contact = null;
+      try {
+        contact = event.target.querySelector('input[type="email"],input[type="tel"],input[name*="email" i],input[name*="phone" i],input[name*="whats" i]');
+      } catch (_error) {
+        contact = event.target.querySelector('input[type="email"],input[type="tel"]');
+      }
+      if (contact) track('Lead', true);
+    }, true);
+    root.addEventListener('pagehide', flush);
+    doc.addEventListener('visibilitychange', () => { if (doc.visibilityState === 'hidden') flush(); });
+  }
+
+  const api = {
+    start, trackingFromUrl, trackingParams, visitorId, rememberTracking, storedFbc, decorateHref, isCheckoutClick, normalizeText,
+  };
+
+  // Na loja o script vem do /assets (a CSP da loja só aceita scripts do próprio domínio) com a configuração no atributo
+  // data-alfa-utms-config da tag; o código colado nas páginas não tem o atributo e espera o start que o servidor põe no fim.
+  try {
+    const tag = root.document && root.document.currentScript;
+    const raw = tag && typeof tag.getAttribute === 'function' ? tag.getAttribute('data-alfa-utms-config') : null;
+    if (raw) start(JSON.parse(raw));
+  } catch (_error) { /* configuração ilegível: a página segue sem o script */ }
+
+  return api;
+}));
+
+window.AlfaUtmsPixel.start({"key":"a3eb7bef4a24","endpoint":"https://checkout.alfacademi.com.br/t/e","checkoutHost":"checkout.alfacademi.com.br","active":true,"testMode":false,"pixelId":"1284170466741867","events":{"InitiateCheckout":true,"Lead":false,"AddToCart":false},"icDetection":"text","icMatchValues":[],"icAutoDetect":true});
